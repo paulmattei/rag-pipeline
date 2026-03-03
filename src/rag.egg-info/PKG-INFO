@@ -1,0 +1,368 @@
+Metadata-Version: 2.4
+Name: rag
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: litellm>=1.82.0
+Requires-Dist: markdown>=3.10.2
+Requires-Dist: matplotlib>=3.10.8
+Requires-Dist: onnxruntime>=1.24.2
+Requires-Dist: optimum[onnxruntime]>=2.1.0
+Requires-Dist: python-dotenv>=1.2.2
+Requires-Dist: pyyaml>=6.0.3
+Requires-Dist: requests>=2.32.5
+Requires-Dist: sentence-transformers>=5.2.3
+Requires-Dist: weaviate-client>=4.20.3
+Requires-Dist: google-api-python-client>=2.0.0
+Requires-Dist: google-auth-httplib2>=0.1.0
+Requires-Dist: google-auth-oauthlib>=1.0.0
+
+# Weaviate Docs to Confluence RAG Pipeline
+
+Import Weaviate documentation from GitHub into Confluence, then use it for RAG (Retrieval-Augmented Generation).
+
+## Pipeline Overview
+
+```
+GitHub Repo ──> Parse & Resolve ──> Convert to HTML ──> Upload to Confluence ──> Chunk for RAG
+(weaviate-io)   (MDX/MD files)      (Confluence format)  (REST API)             (future)
+     [done]          [done]              [todo]            [todo]                [todo]
+```
+
+## How the Weaviate Docs Are Structured
+
+The repo uses Docusaurus (MDX). Pages aren't standalone — they import content from other files:
+
+```
+blog/2024-02-01-py-client-v4/index.mdx    <-- top-level page
+│
+├── import Core from './_core-include.mdx'  <-- local MDX include
+│   │
+│   └── <FilteredTextBlock                  <-- pulls code from source file
+│         text={PyCode}
+│         startMarker="# Example"
+│         endMarker="# END Example" />
+│           │
+│           └── _includes/code/example.py   <-- actual code with markers
+│               # Example
+│               client = weaviate.connect()
+│               # END Example
+│
+└── import WhatsNext from '/_includes/what-next.mdx'  <-- decorative footer (skip)
+```
+
+To get the full page content, we discover dependencies top-down (page → includes →
+source files), then resolve bottom-up (read source code first, inline into includes,
+inline into pages).
+
+## Data Classes
+
+```
+Document                    ImportGraph
+├── title: str              ├── pages: {Path: [Path, ...]}
+├── body: str               └── top_level_pages() -> [Path, ...]
+├── source_path: Path
+└── metadata: dict
+```
+
+- **Document** — a parsed markdown/mdx file. `title` comes from YAML frontmatter
+  (falls back to filename). `body` is the content with frontmatter stripped.
+  `metadata` holds remaining frontmatter fields (tags, date, slug, etc.).
+
+- **ImportGraph** — maps every md/mdx file to the files it imports.
+  `top_level_pages()` returns files that no other file imports — these are the
+  actual documentation pages (not fragments/includes).
+
+## Detailed Pipeline — Every Function Explained
+
+### Stage 1: Get the Source Files
+
+#### `clone_or_pull(repo_url, local_path)`
+
+Clones the Weaviate docs repo from GitHub using `git clone --depth 1` (shallow
+clone — latest snapshot only, no history). If the repo already exists locally,
+runs `git pull` to update it.
+
+**Why:** We need the raw source files to process. Shallow clone keeps it fast.
+
+**Error handling:** Logs and re-raises `CalledProcessError` (git failure) and
+`FileNotFoundError` (git not installed). The caller (main) decides whether to exit.
+
+---
+
+### Stage 2: Understand the File Structure
+
+#### `build_import_graph(repo_dir) -> ImportGraph`
+
+Scans every `.md` and `.mdx` file in the repo. For each file, parses its import
+statements to find which other files it depends on. Returns an `ImportGraph`.
+
+**Why:** We need to know which files are top-level pages vs reusable fragments.
+A file that gets imported by other files is a fragment — we don't process it
+standalone, we inline it into the pages that use it.
+
+**Calls:** `parse_file_imports` for each file.
+
+#### `parse_file_imports(text, file_path, repo_dir) -> list[Path]`
+
+Parses all import statements in a file (both MDX includes and `!!raw-loader!`
+code imports) and resolves them to absolute file paths on disk.
+
+Handles two path styles:
+- Absolute: `/_includes/code.mdx` → resolved relative to repo root
+- Relative: `./_local.mdx` → resolved relative to the importing file
+
+Skips theme imports like `@theme/Tabs` (React components, not files we can read).
+Only returns paths that actually exist on disk.
+
+**Why:** `build_import_graph` needs to know the dependency relationships between
+files. This function figures out "file A imports file B" for a single file.
+
+**Note:** Overlaps with `parse_raw_imports` — see "Why Three Import Parsers?" below.
+
+---
+
+### Stage 3: Parse Individual Files
+
+#### `parse_document(file_path) -> Document | None`
+
+Reads a markdown/mdx file and returns a `Document` with:
+- `title` extracted from YAML frontmatter (falls back to filename)
+- `body` with frontmatter stripped
+- `metadata` with remaining frontmatter fields
+- `source_path` for reference
+
+Returns `None` if the file can't be read (encoding errors, missing file).
+
+**Why:** Structures raw file content into a clean object for downstream processing.
+
+**Calls:** `extract_frontmatter` and `strip_frontmatter`.
+
+#### `extract_frontmatter(text) -> dict`
+
+Uses regex to find the YAML block between `---` delimiters at the start of a file.
+Parses it with `yaml.safe_load` into a Python dict.
+
+```
+---                          {"title": "My Page",
+title: My Page        →       "tags": ["search", "api"],
+tags: [search, api]            "sidebar_position": 3}
+sidebar_position: 3
+---
+```
+
+Returns `{}` if no frontmatter found or if YAML is malformed (logs a warning).
+
+**Why:** Frontmatter contains the page title, which we use as the Confluence page
+title. Other fields (tags, date, slug) are stored in `metadata` for potential future use.
+
+#### `strip_frontmatter(text) -> str`
+
+Removes the YAML frontmatter block from the start of the text, returning just
+the body content.
+
+**Why:** The frontmatter is metadata, not content. We extract it separately with
+`extract_frontmatter` and don't want it in the body that gets converted to HTML.
+
+---
+
+### Stage 4: Resolve Imports and Code Snippets
+
+#### `parse_mdx_imports(text, file_path, repo_dir) -> dict[str, Path]`
+
+Parses MDX file imports and returns `{component_name: resolved_path}`.
+Only includes imports pointing to actual `.md`/`.mdx` files on disk.
+Excludes `!!raw-loader!` imports and `@theme` imports.
+
+**Why:** Used by `inline_mdx_includes` to know which component names map to
+which files, so it can replace `<Intro />` with the content of `_intro.mdx`.
+
+**Note:** Overlaps with `parse_file_imports` — see "Why Three Import Parsers?" below.
+
+#### `inline_mdx_includes(text, file_path, repo_dir) -> str`
+
+For each MDX import like `import Intro from './_intro.mdx'`, finds usages of
+`<Intro />` in the text and replaces them with the file's content (frontmatter
+stripped). Recurses into included files to handle nested includes.
+
+**Why:** MDX pages import reusable content fragments. We need to inline them
+to get the full page content.
+
+**Calls:** `parse_mdx_imports`, `strip_frontmatter`, itself (recursion).
+
+#### `parse_raw_imports(text) -> dict[str, str]`
+
+Parses `!!raw-loader!` import statements and returns a mapping of
+`{variable_name: file_path}`.
+
+```
+import EndToEndPyCode from '!!raw-loader!/_includes/code/quickstart/endtoend.py';
+→ {"EndToEndPyCode": "/_includes/code/quickstart/endtoend.py"}
+```
+
+**Why:** `FilteredTextBlock` components reference code by variable name
+(`text={EndToEndPyCode}`). We need to map that variable name back to the
+source file so we can read it and extract the relevant code section.
+
+**Note:** Overlaps with `parse_file_imports` — see "Why Three Import Parsers?" below.
+
+#### `extract_between_markers(text, start, end) -> str`
+
+Extracts text between two comment markers in a source code file.
+
+```python
+# START Example           # Input: full file content
+import weaviate           # start="# START Example"
+client = weaviate.Client  # end="# END Example"
+# END Example             # Output: "import weaviate\nclient = weaviate.Client\n"
+```
+
+End markers are checked before start markers on each line. This is intentional —
+Weaviate source files can have multiple markers on one line
+(e.g. `# END Foo  # END Bar`). Uses `in` matching rather than exact line matching
+for this reason.
+
+Returns empty string if markers aren't found. If only start is found (no end),
+collects everything after the start marker.
+
+**Why:** The Weaviate docs store code examples in full Python/TypeScript/Go files
+with comment markers delimiting sections. `FilteredTextBlock` specifies which
+section to display. This function extracts that section.
+
+#### `resolve_filtered_text_blocks(text, repo_dir) -> str`
+
+Finds all `<FilteredTextBlock ... />` tags in the text and replaces each one
+with a markdown fenced code block containing the actual code.
+
+For each tag it:
+1. Calls `parse_raw_imports` to map variable names to source file paths
+2. Extracts the `text={VarName}`, `startMarker`, `endMarker`, and `language` props
+3. Looks up the variable name to find the source file on disk
+4. Reads the source file and calls `extract_between_markers` to get the code
+5. Replaces the tag with `` ```language ... ``` ``
+
+If the source file is missing or a tag is malformed, it logs a warning and
+removes the tag (returns empty string for that block).
+
+**Why:** This is the key function that resolves the Docusaurus `FilteredTextBlock`
+component into plain markdown that we can convert to Confluence HTML.
+
+**Calls:** `parse_raw_imports`, `extract_between_markers`.
+
+---
+
+### Stage 5: Strip MDX Syntax
+
+#### `strip_mdx_syntax(text) -> str`
+
+Removes remaining MDX/JSX syntax after imports and code blocks are resolved:
+
+- **JS/MDX import statements** — `import X from '...'` and `import { X } from '...'`
+  (only applied outside fenced code blocks, so Python/JS imports in examples are preserved)
+- **HTML comments** — `<!-- truncate -->` (including multiline)
+- **Docusaurus admonitions** — `:::tip` → `**Tip:**`, `:::info Glossary` → `**Glossary:**`
+  (content is kept, markers are converted to bold labels for RAG context)
+- **JSX/HTML tags** — `<Tabs>`, `</TabItem>`, `<WhatNext />`, etc.
+  (tags removed, text content between them kept)
+- **Excessive blank lines** — collapsed to double newlines
+
+**Why:** After resolving imports and code blocks, there's still JSX syntax that
+isn't valid markdown. This function produces clean markdown suitable for
+conversion to HTML or chunking for RAG.
+
+---
+
+### Stage 6: Resolve Full Documents
+
+#### `resolve_document(page_path, repo_dir) -> Document | None`
+
+Ties together the full pipeline for a single page:
+1. `parse_document` — extract frontmatter, strip it
+2. `inline_mdx_includes` — replace `<Component />` with imported file content
+3. `resolve_filtered_text_blocks` — replace code block tags with actual code
+4. `strip_mdx_syntax` — clean up remaining JSX/MDX syntax
+
+Returns a `Document` with clean markdown body, title, and metadata.
+
+**Why:** This is the main entry point for processing. Call it for each
+top-level page from `ImportGraph.top_level_pages()`.
+
+---
+
+## Why Three Import Parsers?
+
+`parse_file_imports`, `parse_raw_imports`, and `parse_mdx_imports` all parse
+import statements but serve different purposes:
+
+| | `parse_file_imports` | `parse_raw_imports` | `parse_mdx_imports` |
+|---|---|---|---|
+| **Used by** | `build_import_graph` | `resolve_filtered_text_blocks` | `inline_mdx_includes` |
+| **Returns** | `list[Path]` | `dict[str, str]` (var → path) | `dict[str, Path]` (name → path) |
+| **Matches** | All file imports | Only `!!raw-loader!` | Only `.md`/`.mdx` files |
+| **Key difference** | Discards variable names | Preserves var names | Preserves component names |
+
+- `parse_file_imports` — for the dependency graph. Needs all imports, doesn't care about names.
+- `parse_raw_imports` — for FilteredTextBlock. Needs `{EndToEndPyCode: "endtoend.py"}`.
+- `parse_mdx_imports` — for inlining includes. Needs `{Intro: Path("_intro.mdx")}`.
+
+## What's Done
+
+- [x] Clone/pull the Weaviate docs repo from GitHub
+- [x] Build an import graph to discover top-level pages vs includes
+- [x] Parse documents — extract frontmatter, strip it, create `Document` objects
+- [x] Parse raw-loader imports — map variable names to source file paths
+- [x] Extract code between markers from source files
+- [x] Resolve `<FilteredTextBlock>` tags into markdown code blocks
+- [x] Parse MDX imports — map component names to file paths
+- [x] Inline MDX includes — replace `<Component />` with file content (recursive)
+- [x] Strip MDX syntax — remove imports, JSX tags, convert admonitions to bold labels
+- [x] `resolve_document` — full pipeline for a single page
+- [x] Ruff linting and formatting
+- [x] Test suite (41 tests)
+
+## Still To Build
+
+### Convert markdown to Confluence storage format HTML
+1. We need to go from our parsed documents to a format we can upload to Confluence.
+
+### Confluence Upload
+
+1. **Create Confluence space** — create a space to hold the imported docs
+2. **Upload pages** — create pages via REST API with parent/child hierarchy
+   preserving the directory structure from the docs repo
+3. **Handle updates** — strategy for updating existing pages when docs change
+
+### RAG Pipeline
+
+4. **Chunking** — split resolved documents into chunks for embedding
+5. **Embeddings** — generate vector embeddings for each chunk
+6. **Vector store** — store embeddings in Weaviate
+7. **Retrieval & generation** — query pipeline using Claude
+
+## Project Structure
+
+```
+models.py       — Document and ImportGraph dataclasses
+git.py          — clone_or_pull (repo cloning/updating)
+parsing.py      — all MDX/markdown parsing, resolution, and import graph building
+main.py         — entry point / pipeline orchestration
+test_import_docs.py — 41 tests
+```
+
+## Running
+
+```bash
+# Install dependencies
+uv add markdown pyyaml
+
+# Run the script
+uv run python main.py
+
+# Run tests
+uv run pytest test_import_docs.py -v
+
+# Lint
+uv run ruff check .
+uv run ruff format .
+```

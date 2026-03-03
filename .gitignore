@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.env
+
+# Credentials & secrets
+credentials.json
+token.json
+
+# IDE / editor / agents
+.vscode/
+.idea/
+.agents/
+CLAUDE.md
+.claude/
+
+# Testing & linting caches
+.pytest_cache/
+.ruff_cache/
+
+# Project-specific
+weaviate-docs/
+confluence/
+cache/
+torchinductor_paulmattei/
+
+# Images & analysis artifacts
+*.jpg
+*.png
+*.svg
+
+# Misc scratch files
+diagnose_*.py
+chunks_anaysis.py
+tables.md
+skills-lock.json
